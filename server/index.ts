@@ -1,10 +1,15 @@
 import express, { type Request, type Response } from 'express';
 import type {
   HexRow,
+  HttpRequestInspection,
+  InspectedHeader,
+  InspectedQueryParam,
+  InspectionDiagnostic,
   PacketScenario,
   ParseRequest,
   Protocol,
   ProtocolField,
+  RequestInspection,
   SimulatedPacket,
   TimelineEvent
 } from '../shared/types.js';
@@ -22,7 +27,7 @@ app.use((request, response, next) => {
 });
 
 const HTTP_SAMPLES: Record<PacketScenario, string> = {
-  request: 'GET /api/devices?status=online HTTP/1.1\r\nHost: lab.local\r\nAccept: application/json\r\nUser-Agent: PacketLab/1.0\r\nX-Trace-Id: 7f3a9c\r\n\r\n',
+  request: 'GET /api/devices?status=online&status=standby&q=%E4%BD%A0%E5%A5%BD&debug HTTP/1.1\r\nHost: lab.local\r\nAccept: application/json\r\nUser-Agent: PacketLab/1.0\r\nX-Trace-Id: 7f3a9c\r\n\r\n',
   response: 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 47\r\nCache-Control: no-store\r\n\r\n{"devices":[{"id":"edge-01","status":"online"}]}',
   handshake: 'GET / HTTP/1.1\r\nHost: lab.local\r\nConnection: keep-alive\r\n\r\n'
 };
@@ -51,8 +56,189 @@ function field(id: string, key: string, value: string, description: string, chil
   return { id, key, value, description, ...(children ? { children } : {}) };
 }
 
+function splitHeadBody(raw: string): { head: string; body: string } {
+  const match = raw.match(/\r?\n\r?\n/);
+  if (!match || match.index === undefined) return { head: raw, body: '' };
+  return { head: raw.slice(0, match.index), body: raw.slice(match.index + match[0].length) };
+}
+
+function parseRequestLine(startLine: string): { method: string; target: string; version: string } {
+  const firstSpace = startLine.indexOf(' ');
+  if (firstSpace === -1) return { method: startLine, target: '', version: '' };
+  const lastSpace = startLine.lastIndexOf(' ');
+  if (lastSpace === firstSpace) {
+    return { method: startLine.slice(0, firstSpace), target: startLine.slice(firstSpace + 1), version: '' };
+  }
+  return {
+    method: startLine.slice(0, firstSpace),
+    target: startLine.slice(firstSpace + 1, lastSpace),
+    version: startLine.slice(lastSpace + 1)
+  };
+}
+
+function splitTarget(target: string): { path: string; queryString: string } {
+  const question = target.indexOf('?');
+  return question === -1
+    ? { path: target, queryString: '' }
+    : { path: target.slice(0, question), queryString: target.slice(question + 1) };
+}
+
+/**
+ * Percent-decodes a single component. Byte runs are decoded as UTF-8, "+" is
+ * only treated as a space inside query strings. Malformed "%" sequences stay
+ * verbatim and are reported instead of throwing.
+ */
+function decodeComponent(raw: string, plusAsSpace: boolean): { decoded: string; malformed: string[] } {
+  const malformed: string[] = [];
+  const bytes: number[] = [];
+  const chars: string[] = [];
+  const flushBytes = () => {
+    if (bytes.length) {
+      chars.push(Buffer.from(bytes).toString('utf8'));
+      bytes.length = 0;
+    }
+  };
+  for (let index = 0; index < raw.length; index += 1) {
+    const char = raw[index];
+    if (char === '%') {
+      const hex = raw.slice(index + 1, index + 3);
+      if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
+        bytes.push(parseInt(hex, 16));
+        index += 2;
+      } else {
+        flushBytes();
+        malformed.push(raw.slice(index, Math.min(index + 3, raw.length)));
+        chars.push(char);
+      }
+    } else if (char === '+' && plusAsSpace) {
+      flushBytes();
+      chars.push(' ');
+    } else {
+      flushBytes();
+      chars.push(char);
+    }
+  }
+  flushBytes();
+  return { decoded: chars.join(''), malformed };
+}
+
+function parseQueryParams(queryString: string): InspectedQueryParam[] {
+  // A trailing or doubled "&" produces an empty pair, which is not a real parameter.
+  const pairs = queryString.split('&').filter((pair) => pair.length > 0);
+  const params: InspectedQueryParam[] = pairs.map((pair, index) => {
+    const separator = pair.indexOf('=');
+    const rawKey = separator === -1 ? pair : pair.slice(0, separator);
+    const rawValue = separator === -1 ? null : pair.slice(separator + 1);
+    const keyResult = decodeComponent(rawKey, true);
+    const valueResult = rawValue === null ? null : decodeComponent(rawValue, true);
+    const diagnostics: InspectionDiagnostic[] = [];
+
+    if (keyResult.malformed.length) {
+      diagnostics.push({
+        code: 'malformed-encoding',
+        message: `键包含错误的百分号编码序列：${keyResult.malformed.join('、')}`,
+        segment: rawKey
+      });
+    }
+    if (valueResult?.malformed.length) {
+      diagnostics.push({
+        code: 'malformed-encoding',
+        message: `值包含错误的百分号编码序列：${valueResult.malformed.join('、')}`,
+        segment: rawValue ?? ''
+      });
+    }
+    if (rawKey !== keyResult.decoded || (rawValue !== null && rawValue !== valueResult?.decoded)) {
+      diagnostics.push({
+        code: 'encoded-char',
+        message: '包含百分号编码字符，原始文本经解码后得到当前值',
+        segment: pair
+      });
+    }
+    if (rawValue === null) {
+      diagnostics.push({
+        code: 'valueless-param',
+        message: '参数没有 "="，不存在对应的值',
+        segment: rawKey
+      });
+    }
+
+    return {
+      id: `insp-query-${index}`,
+      fieldId: `query-${index}`,
+      key: keyResult.decoded,
+      rawKey,
+      value: valueResult ? valueResult.decoded : null,
+      rawValue,
+      occurrences: 1,
+      diagnostics
+    };
+  });
+
+  const counts = new Map<string, number>();
+  for (const param of params) counts.set(param.key, (counts.get(param.key) ?? 0) + 1);
+  for (const param of params) {
+    param.occurrences = counts.get(param.key) ?? 1;
+    if (param.occurrences > 1) {
+      param.diagnostics.push({
+        code: 'duplicate-key',
+        message: `键 "${param.key}" 在 query 中重复出现 ${param.occurrences} 次`,
+        segment: param.rawKey
+      });
+    }
+  }
+  return params;
+}
+
+function inspectHttpRequest(raw: string): HttpRequestInspection {
+  const { head, body } = splitHeadBody(raw);
+  const lines = head.split(/\r?\n/);
+  const startLine = lines.shift() ?? '';
+  const { method, target } = parseRequestLine(startLine);
+  const { path, queryString } = splitTarget(target);
+  const pathResult = decodeComponent(path, false);
+
+  const pathDiagnostics: InspectionDiagnostic[] = [];
+  if (pathResult.malformed.length) {
+    pathDiagnostics.push({
+      code: 'malformed-encoding',
+      message: `路径包含错误的百分号编码序列：${pathResult.malformed.join('、')}`,
+      segment: path
+    });
+  }
+  if (path !== pathResult.decoded) {
+    pathDiagnostics.push({
+      code: 'encoded-char',
+      message: `路径包含编码字符，解码前为 "${path}"`,
+      segment: path
+    });
+  }
+
+  const query = parseQueryParams(queryString);
+  const headers: InspectedHeader[] = lines.map((line, index) => {
+    const separator = line.indexOf(':');
+    return {
+      id: `insp-header-${index}`,
+      fieldId: `header-${index}`,
+      key: separator > -1 ? line.slice(0, separator).trim() : `Header-${index + 1}`,
+      value: separator > -1 ? line.slice(separator + 1).trim() : line.trim(),
+      raw: line
+    };
+  });
+
+  return {
+    applicable: true,
+    method: { value: method, fieldId: 'http-part-1' },
+    target: { raw: target, fieldId: 'http-part-2' },
+    path: { raw: path, decoded: pathResult.decoded, fieldId: 'http-part-2', diagnostics: pathDiagnostics },
+    query,
+    headers,
+    body: { raw: body, fieldId: 'http-body' },
+    diagnostics: [...pathDiagnostics, ...query.flatMap((param) => param.diagnostics)]
+  };
+}
+
 function parseHttpFields(raw: string): ProtocolField[] {
-  const [head, body = ''] = raw.split(/\r?\n\r?\n/);
+  const { head, body } = splitHeadBody(raw);
   const lines = head.split(/\r?\n/);
   const startLine = lines.shift() ?? '';
   const headers = lines.map((line, index) => {
@@ -63,15 +249,38 @@ function parseHttpFields(raw: string): ProtocolField[] {
   });
   const isResponse = startLine.startsWith('HTTP/');
   const [first, second, third] = startLine.split(' ');
-  return [
+  const branches: ProtocolField[] = [
     field('http-start-line', isResponse ? 'Status-Line' : 'Request-Line', startLine, isResponse ? 'HTTP version and response status' : 'HTTP method, target and version', [
       field('http-part-1', isResponse ? 'Version' : 'Method', first ?? '—', isResponse ? 'Protocol version' : 'HTTP request method'),
       field('http-part-2', isResponse ? 'Status' : 'Target', second ?? '—', isResponse ? 'Status code' : 'Request target'),
       field('http-part-3', isResponse ? 'Reason' : 'Version', isResponse ? (third ?? '—') : (third ?? '—'), isResponse ? 'Reason phrase' : 'Protocol version')
-    ]),
+    ])
+  ];
+
+  if (!isResponse) {
+    const { target } = parseRequestLine(startLine);
+    const queryParams = parseQueryParams(splitTarget(target).queryString);
+    if (queryParams.length) {
+      branches.push(field('http-query', 'Query Parameters', `${queryParams.length} params`, 'Structured parameters parsed from the request target', queryParams.map((param) => {
+        const notes = param.diagnostics.map((diagnostic) => diagnostic.code);
+        const rawNote = param.rawKey !== param.key || (param.rawValue !== null && param.rawValue !== param.value)
+          ? ` · raw: ${param.rawKey}${param.rawValue === null ? '' : `=${param.rawValue}`}`
+          : '';
+        return field(
+          param.fieldId,
+          param.key || '(empty key)',
+          param.value === null ? '(no value)' : param.value,
+          `${notes.length ? notes.join(', ') : 'query parameter'}${rawNote}`
+        );
+      })));
+    }
+  }
+
+  branches.push(
     field('http-headers', 'Headers', `${headers.length} fields`, 'Metadata carried by the application layer', headers),
     field('http-body', 'Payload', body || '(empty)', 'Application payload after the header terminator')
-  ];
+  );
+  return branches;
 }
 
 function parseTcpFields(raw: string): ProtocolField[] {
@@ -133,6 +342,18 @@ function checksum(raw: string): string {
   return `0x${hash.toString(16).padStart(4, '0').toUpperCase()}`;
 }
 
+function buildInspection(protocol: Protocol, raw: string): RequestInspection {
+  if (protocol !== 'HTTP') {
+    return { applicable: false, reason: 'TCP 段不携带 HTTP 请求语义（方法、query、header），请求语义检查器不适用。' };
+  }
+  const { head } = splitHeadBody(raw);
+  const startLine = head.split(/\r?\n/)[0] ?? '';
+  if (startLine.startsWith('HTTP/')) {
+    return { applicable: false, reason: '当前报文以状态行起始，是 HTTP 响应；请求语义检查器仅解析 HTTP 请求。' };
+  }
+  return inspectHttpRequest(raw);
+}
+
 function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string): SimulatedPacket {
   const safeRaw = raw.trim() ? raw : (protocol === 'HTTP' ? HTTP_SAMPLES[scenario] : TCP_SAMPLES[scenario]);
   const isHttp = protocol === 'HTTP';
@@ -147,6 +368,7 @@ function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string):
     hex: hexDump(safeRaw),
     fields: isHttp ? parseHttpFields(safeRaw) : parseTcpFields(safeRaw),
     timeline: timelineFor(protocol, scenario),
+    inspection: buildInspection(protocol, safeRaw),
     metadata: {
       capturedAt: new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'),
       source: isHttp ? '10.0.0.24:51842' : safeRaw.split(' > ')[0].replace('TCP ', ''),

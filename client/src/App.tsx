@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import type {
+  InspectionDiagnostic,
+  InspectionDiagnosticCode,
   PacketScenario,
   ParseRequest,
   Protocol,
   ProtocolField,
+  RequestInspection,
   SimulatedPacket,
   TimelineEvent
 } from '../../shared/types';
@@ -23,7 +26,8 @@ function App() {
   const [packet, setPacket] = useState<SimulatedPacket | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [activeView, setActiveView] = useState<'overview' | 'hex'>('overview');
+  const [activeView, setActiveView] = useState<'overview' | 'hex' | 'inspector'>('overview');
+  const [highlightFieldId, setHighlightFieldId] = useState<string | null>(null);
 
   const availableScenarios = useMemo<PacketScenario[]>(
     () => (protocol === 'TCP' ? ['handshake', 'request', 'response'] : ['request', 'response']),
@@ -45,6 +49,7 @@ function App() {
       );
       setPacket(result.data);
       setRawInput(result.data.raw);
+      setHighlightFieldId(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '加载模拟数据失败');
     } finally {
@@ -64,11 +69,17 @@ function App() {
       });
       setPacket(result.data);
       setRawInput(result.data.raw);
+      setHighlightFieldId(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '解析数据包失败');
     } finally {
       setLoading(false);
     }
+  };
+
+  const jumpToField = (fieldId: string) => {
+    setActiveView('overview');
+    setHighlightFieldId(fieldId);
   };
 
   useEffect(() => {
@@ -158,8 +169,16 @@ function App() {
             </div>
 
             <div className="panel details-panel">
-              <div className="tabs"><button className={activeView === 'overview' ? 'selected' : ''} onClick={() => setActiveView('overview')}>协议字段树</button><button className={activeView === 'hex' ? 'selected' : ''} onClick={() => setActiveView('hex')}>十六进制视图</button></div>
-              {activeView === 'overview' ? <FieldTree fields={packet?.fields ?? []} /> : <HexView rows={packet?.hex ?? []} />}
+              <div className="tabs">
+                <button className={activeView === 'overview' ? 'selected' : ''} onClick={() => setActiveView('overview')}>协议字段树</button>
+                <button className={activeView === 'hex' ? 'selected' : ''} onClick={() => setActiveView('hex')}>十六进制视图</button>
+                <button className={activeView === 'inspector' ? 'selected' : ''} onClick={() => setActiveView('inspector')}>请求检查器</button>
+              </div>
+              {activeView === 'overview'
+                ? <FieldTree fields={packet?.fields ?? []} highlightId={highlightFieldId} />
+                : activeView === 'hex'
+                  ? <HexView rows={packet?.hex ?? []} />
+                  : <RequestInspector inspection={packet?.inspection} onJump={jumpToField} />}
             </div>
           </div>
         </section>
@@ -173,23 +192,189 @@ function Meta({ label, value }: { label: string; value: string }) {
   return <div className="meta-item"><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function FieldTree({ fields }: { fields: ProtocolField[] }) {
+function FieldTree({ fields, highlightId }: { fields: ProtocolField[]; highlightId: string | null }) {
+  const ancestorIds = useMemo(() => {
+    const set = new Set<string>();
+    if (!highlightId) return set;
+    const walk = (nodes: ProtocolField[], trail: string[]) => {
+      for (const node of nodes) {
+        if (node.id === highlightId) trail.forEach((id) => set.add(id));
+        else if (node.children?.length) walk(node.children, [...trail, node.id]);
+      }
+    };
+    walk(fields, []);
+    return set;
+  }, [fields, highlightId]);
+
   if (!fields.length) return <div className="empty-state">解析后将在这里显示协议层级字段。</div>;
-  return <div className="field-tree">{fields.map((field) => <FieldNode key={field.id} field={field} depth={0} />)}</div>;
+  return (
+    <div className="field-tree">
+      {fields.map((fieldNode) => (
+        <FieldNode key={fieldNode.id} field={fieldNode} depth={0} highlightId={highlightId} ancestorIds={ancestorIds} />
+      ))}
+    </div>
+  );
 }
 
-function FieldNode({ field, depth }: { field: ProtocolField; depth: number }) {
+function FieldNode({ field, depth, highlightId, ancestorIds }: { field: ProtocolField; depth: number; highlightId: string | null; ancestorIds: Set<string> }) {
   const [expanded, setExpanded] = useState(true);
+  const rowRef = useRef<HTMLDivElement>(null);
   const hasChildren = Boolean(field.children?.length);
+  const isHighlighted = field.id === highlightId;
+
+  useEffect(() => {
+    if (ancestorIds.has(field.id)) setExpanded(true);
+  }, [ancestorIds, field.id]);
+
+  useEffect(() => {
+    if (!isHighlighted) return;
+    const timer = window.setTimeout(() => rowRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 60);
+    return () => window.clearTimeout(timer);
+  }, [isHighlighted, highlightId]);
+
   return <div className="field-node" style={{ '--depth': depth } as CSSProperties}>
-    <div className="field-row" onClick={() => hasChildren && setExpanded((value) => !value)}>
+    <div ref={rowRef} className={`field-row${isHighlighted ? ' highlighted' : ''}`} onClick={() => hasChildren && setExpanded((value) => !value)}>
       <span className={`chevron ${hasChildren ? '' : 'invisible'} ${expanded ? 'open' : ''}`}>⌄</span>
       <span className="field-key">{field.key}</span>
       <span className="field-value">{field.value}</span>
       <span className="field-description">{field.description}</span>
     </div>
-    {hasChildren && expanded && <div className="field-children">{field.children!.map((child) => <FieldNode key={child.id} field={child} depth={depth + 1} />)}</div>}
+    {hasChildren && expanded && <div className="field-children">{field.children!.map((child) => <FieldNode key={child.id} field={child} depth={depth + 1} highlightId={highlightId} ancestorIds={ancestorIds} />)}</div>}
   </div>;
+}
+
+const diagnosticLabels: Record<InspectionDiagnosticCode, string> = {
+  'encoded-char': '编码字符',
+  'malformed-encoding': '编码错误',
+  'duplicate-key': '重复 key',
+  'valueless-param': '无值参数'
+};
+
+function DiagnosticBadges({ diagnostics }: { diagnostics: InspectionDiagnostic[] }) {
+  if (!diagnostics.length) return null;
+  return (
+    <span className="diag-badges">
+      {diagnostics.map((diagnostic, index) => (
+        <span key={index} className={`diag-badge diag-${diagnostic.code}`} title={diagnostic.message}>
+          {diagnosticLabels[diagnostic.code]}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function InspectorRow({ fieldId, fieldKey, children, onJump }: { fieldId: string; fieldKey: string; children: ReactNode; onJump: (fieldId: string) => void }) {
+  return (
+    <button type="button" className="insp-row" onClick={() => onJump(fieldId)} title="在协议字段树中定位此项">
+      <span className="insp-key">{fieldKey}</span>
+      <span className="insp-value">{children}</span>
+      <span className="insp-jump" aria-hidden>↪ 字段树</span>
+    </button>
+  );
+}
+
+function InspectorSection({ title, count, children }: { title: string; count?: number; children: ReactNode }) {
+  return (
+    <section className="insp-section">
+      <div className="insp-section-title">
+        <span>{title}</span>
+        {count !== undefined && <span>{count} 项</span>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function RawHint({ label, value }: { label: string; value: string }) {
+  return <span className="insp-raw">{label}: {value}</span>;
+}
+
+function RequestInspector({ inspection, onJump }: { inspection: RequestInspection | undefined; onJump: (fieldId: string) => void }) {
+  if (!inspection) {
+    return (
+      <div className="empty-state na-state">
+        <span className="na-chip">N / A</span>
+        <p>等待数据包载入。</p>
+      </div>
+    );
+  }
+
+  if (!inspection.applicable) {
+    return (
+      <div className="empty-state na-state">
+        <span className="na-chip">N / A · 不适用</span>
+        <p>请求语义检查器对当前数据包不适用。</p>
+        <p className="na-reason">{inspection.reason}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="inspector">
+      {inspection.diagnostics.length > 0 && (
+        <section className="diag-summary">
+          <div className="diag-summary-title">⚠ {inspection.diagnostics.length} 项局部诊断 · 原始文本已保留</div>
+          {inspection.diagnostics.map((diagnostic, index) => (
+            <div className="diag-item" key={index}>
+              <span className={`diag-badge diag-${diagnostic.code}`}>{diagnosticLabels[diagnostic.code]}</span>
+              <span className="diag-message">{diagnostic.message}</span>
+              <code className="diag-segment">{diagnostic.segment}</code>
+            </div>
+          ))}
+        </section>
+      )}
+
+      <InspectorSection title="请求行 / REQUEST LINE">
+        <InspectorRow fieldId={inspection.method.fieldId} fieldKey="Method" onJump={onJump}>
+          {inspection.method.value || '(empty)'}
+        </InspectorRow>
+        <InspectorRow fieldId={inspection.target.fieldId} fieldKey="Target 原始" onJump={onJump}>
+          {inspection.target.raw || '(empty)'}
+        </InspectorRow>
+        <InspectorRow fieldId={inspection.path.fieldId} fieldKey="Path 解码" onJump={onJump}>
+          {inspection.path.decoded || '(empty)'}
+          {inspection.path.raw !== inspection.path.decoded && <RawHint label="原始" value={inspection.path.raw} />}
+          <DiagnosticBadges diagnostics={inspection.path.diagnostics} />
+        </InspectorRow>
+      </InspectorSection>
+
+      <InspectorSection title="Query 参数 / QUERY PARAMETERS" count={inspection.query.length}>
+        {inspection.query.length === 0
+          ? <div className="insp-empty">请求目标不包含 query 参数。</div>
+          : inspection.query.map((param) => (
+            <InspectorRow key={param.id} fieldId={param.fieldId} fieldKey={param.key || '(空 key)'} onJump={onJump}>
+              {param.value === null ? <em className="insp-novalue">(无值)</em> : param.value}
+              {(param.rawKey !== param.key || (param.rawValue !== null && param.rawValue !== param.value)) && (
+                <RawHint label="原始" value={`${param.rawKey}${param.rawValue === null ? '' : `=${param.rawValue}`}`} />
+              )}
+              <DiagnosticBadges diagnostics={param.diagnostics} />
+            </InspectorRow>
+          ))}
+      </InspectorSection>
+
+      <InspectorSection title="请求头 / HEADERS" count={inspection.headers.length}>
+        {inspection.headers.length === 0
+          ? <div className="insp-empty">请求不包含任何 header。</div>
+          : inspection.headers.map((header) => (
+            <InspectorRow key={header.id} fieldId={header.fieldId} fieldKey={header.key} onJump={onJump}>
+              {header.value || '(empty)'}
+            </InspectorRow>
+          ))}
+      </InspectorSection>
+
+      <InspectorSection title="请求体 / BODY">
+        <button type="button" className="insp-row insp-row-body" onClick={() => onJump(inspection.body.fieldId)} title="在协议字段树中定位此项">
+          <span className="insp-key">Payload</span>
+          <span className="insp-value">
+            {inspection.body.raw
+              ? <code className="insp-body">{inspection.body.raw}</code>
+              : <em className="insp-novalue">(empty)</em>}
+          </span>
+          <span className="insp-jump" aria-hidden>↪ 字段树</span>
+        </button>
+      </InspectorSection>
+    </div>
+  );
 }
 
 function Timeline({ events }: { events: TimelineEvent[] }) {
