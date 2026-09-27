@@ -33,10 +33,11 @@ network-packet-lab/
 
 1. **模拟数据选择**：在 HTTP / TCP 协议之间切换，并选择请求、响应或 TCP 握手场景。
 2. **数据包输入**：编辑原始 HTTP 文本或 TCP 模拟摘要，点击“解析数据包”重新生成可视化结果。
-3. **协议字段树**：HTTP 展示起始行、Header、Payload；TCP 展示 Ethernet、IPv4、TCP 和 Payload 层级，并支持折叠。
-4. **十六进制视图**：以 offset、hex bytes、ASCII 三列展示当前 payload 的 UTF-8 字节。
-5. **传输时间线**：展示抓包、解析、传输层解码和结构化输出等阶段。
-6. **解析 API / 模拟数据 API**：Express 服务提供 `/api/parse`、`/api/simulate`、`/api/packets` 和 `/api/health`。
+3. **协议字段树**：HTTP 展示起始行、Header、Payload（请求目标下挂 Path 与逐条 Query 参数节点）；TCP 展示 Ethernet、IPv4、TCP 和 Payload 层级，并支持折叠。
+4. **请求语义检查器**：从解析后的 HTTP 请求中提取方法、路径、Query 参数、重复参数、Header 与 Body，支持“解码前 / 解码后”视图切换；当请求目标含有编码字符、重复 key、无值参数或 malformed percent-encoding 时，保留原始文本并在对应条目下给出局部诊断（含在原始目标中的偏移位置）。点击检查器中的任意条目可跳回字段树对应节点并高亮。TCP 数据包与 HTTP 响应显示“不适用”状态而非空白。
+5. **十六进制视图**：以 offset、hex bytes、ASCII 三列展示当前 payload 的 UTF-8 字节。
+6. **传输时间线**：展示抓包、解析、传输层解码和结构化输出等阶段。
+7. **解析 API / 模拟数据 API**：Express 服务提供 `/api/parse`、`/api/simulate`、`/api/packets` 和 `/api/health`，响应中的 `inspection` 字段携带请求语义检查结果。
 
 ## 启动方式
 
@@ -87,6 +88,12 @@ curl -X POST 'http://localhost:3001/api/parse' \
   -H 'Content-Type: application/json' \
   -d '{"protocol":"HTTP","scenario":"request","raw":"GET /health HTTP/1.1\\r\\nHost: lab.local\\r\\n\\r\\n"}'
 ```
+
+响应中的 `data.inspection` 即请求语义检查结果：
+
+- `applicable: false`：TCP 数据包或 HTTP 响应，附带 `reason` / `reasonEn` 说明；
+- `applicable: true`：包含 `method`、`path`（`raw` / `decoded` / `diagnostics`）、`query.params`（逐项保留 `rawSegment`、`rawKey` / `decodedKey`、`rawValue` / `decodedValue` 与局部诊断）、`duplicateKeys`、`headers`、`body`，以及汇总后的 `diagnostics`；
+- 每个条目都带有 `fieldId`，对应 `data.fields` 字段树中的节点 `id`，前端据此实现“点击检查器条目 → 高亮字段树节点”的联动。
 
 ### 获取某协议的全部示例
 

@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import type {
+  InspectionDiagnostic,
   PacketScenario,
   ParseRequest,
   Protocol,
   ProtocolField,
+  QueryParamInspection,
+  RequestInspection,
   SimulatedPacket,
   TimelineEvent
 } from '../../shared/types';
@@ -23,7 +26,9 @@ function App() {
   const [packet, setPacket] = useState<SimulatedPacket | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [activeView, setActiveView] = useState<'overview' | 'hex'>('overview');
+  const [activeView, setActiveView] = useState<'overview' | 'inspector' | 'hex'>('overview');
+  const [highlightFieldId, setHighlightFieldId] = useState<string | null>(null);
+  const [expandSignal, setExpandSignal] = useState(0);
 
   const availableScenarios = useMemo<PacketScenario[]>(
     () => (protocol === 'TCP' ? ['handshake', 'request', 'response'] : ['request', 'response']),
@@ -74,6 +79,16 @@ function App() {
   useEffect(() => {
     void loadSample('HTTP', 'request');
   }, []);
+
+  useEffect(() => {
+    setHighlightFieldId(null);
+  }, [packet?.id]);
+
+  const navigateToField = (fieldId: string) => {
+    setActiveView('overview');
+    setHighlightFieldId(fieldId);
+    setExpandSignal((value) => value + 1);
+  };
 
   const changeProtocol = (nextProtocol: Protocol) => {
     const nextScenario = nextProtocol === 'TCP' && scenario === 'response' ? 'handshake' : scenario;
@@ -158,8 +173,16 @@ function App() {
             </div>
 
             <div className="panel details-panel">
-              <div className="tabs"><button className={activeView === 'overview' ? 'selected' : ''} onClick={() => setActiveView('overview')}>协议字段树</button><button className={activeView === 'hex' ? 'selected' : ''} onClick={() => setActiveView('hex')}>十六进制视图</button></div>
-              {activeView === 'overview' ? <FieldTree fields={packet?.fields ?? []} /> : <HexView rows={packet?.hex ?? []} />}
+              <div className="tabs">
+                <button className={activeView === 'overview' ? 'selected' : ''} onClick={() => setActiveView('overview')}>协议字段树</button>
+                <button className={activeView === 'inspector' ? 'selected' : ''} onClick={() => setActiveView('inspector')}>请求检查器</button>
+                <button className={activeView === 'hex' ? 'selected' : ''} onClick={() => setActiveView('hex')}>十六进制视图</button>
+              </div>
+              {activeView === 'overview'
+                ? <FieldTree fields={packet?.fields ?? []} highlightId={highlightFieldId} expandSignal={expandSignal} />
+                : activeView === 'inspector'
+                  ? <RequestInspector inspection={packet?.inspection} onNavigate={navigateToField} />
+                  : <HexView rows={packet?.hex ?? []} />}
             </div>
           </div>
         </section>
@@ -173,22 +196,193 @@ function Meta({ label, value }: { label: string; value: string }) {
   return <div className="meta-item"><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function FieldTree({ fields }: { fields: ProtocolField[] }) {
+function FieldTree({ fields, highlightId, expandSignal }: {
+  fields: ProtocolField[];
+  highlightId: string | null;
+  expandSignal: number;
+}) {
   if (!fields.length) return <div className="empty-state">解析后将在这里显示协议层级字段。</div>;
-  return <div className="field-tree">{fields.map((field) => <FieldNode key={field.id} field={field} depth={0} />)}</div>;
+  return <div className="field-tree">{fields.map((field) => <FieldNode key={field.id} field={field} depth={0} highlightId={highlightId} expandSignal={expandSignal} />)}</div>;
 }
 
-function FieldNode({ field, depth }: { field: ProtocolField; depth: number }) {
+function FieldNode({ field, depth, highlightId, expandSignal }: {
+  field: ProtocolField;
+  depth: number;
+  highlightId: string | null;
+  expandSignal: number;
+}) {
   const [expanded, setExpanded] = useState(true);
   const hasChildren = Boolean(field.children?.length);
+  const highlighted = field.id === highlightId;
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    setExpanded(true);
+  }, [expandSignal]);
+  useEffect(() => {
+    if (highlighted) rowRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [highlighted, expandSignal]);
   return <div className="field-node" style={{ '--depth': depth } as CSSProperties}>
-    <div className="field-row" onClick={() => hasChildren && setExpanded((value) => !value)}>
+    <div ref={rowRef} className={`field-row${highlighted ? ' highlighted' : ''}`} onClick={() => hasChildren && setExpanded((value) => !value)}>
       <span className={`chevron ${hasChildren ? '' : 'invisible'} ${expanded ? 'open' : ''}`}>⌄</span>
       <span className="field-key">{field.key}</span>
       <span className="field-value">{field.value}</span>
       <span className="field-description">{field.description}</span>
     </div>
-    {hasChildren && expanded && <div className="field-children">{field.children!.map((child) => <FieldNode key={child.id} field={child} depth={depth + 1} />)}</div>}
+    {hasChildren && expanded && <div className="field-children">{field.children!.map((child) => <FieldNode key={child.id} field={child} depth={depth + 1} highlightId={highlightId} expandSignal={expandSignal} />)}</div>}
+  </div>;
+}
+
+const diagnosticLabels: Record<InspectionDiagnostic['code'], string> = {
+  encoded: '已编码',
+  'duplicate-key': '重复键',
+  'no-value': '无值',
+  'empty-value': '空值',
+  'malformed-encoding': '编码异常'
+};
+
+function DiagnosticBadges({ diagnostics }: { diagnostics: InspectionDiagnostic[] }) {
+  if (!diagnostics.length) return null;
+  return <span className="diag-badges">
+    {diagnostics.map((diagnostic, index) => (
+      <span key={index} className={`diag diag-${diagnostic.severity}`} title={`${diagnostic.message}\n${diagnostic.messageEn}`}>
+        {diagnosticLabels[diagnostic.code]}{diagnostic.offset !== undefined ? ` @${diagnostic.offset}` : ''}
+      </span>
+    ))}
+  </span>;
+}
+
+function DiagnosticList({ diagnostics }: { diagnostics: InspectionDiagnostic[] }) {
+  if (!diagnostics.length) return null;
+  return <ul className="diag-list">
+    {diagnostics.map((diagnostic, index) => (
+      <li key={index} className={`diag-${diagnostic.severity}`}>{diagnostic.message}</li>
+    ))}
+  </ul>;
+}
+
+function RequestInspector({ inspection, onNavigate }: {
+  inspection?: RequestInspection;
+  onNavigate: (fieldId: string) => void;
+}) {
+  const [mode, setMode] = useState<'raw' | 'decoded'>('decoded');
+  if (!inspection) return <div className="empty-state">解析后将在这里显示请求方法、路径、查询参数、Header 与 Body。</div>;
+  if (!inspection.applicable) {
+    return <div className="inspector-na">
+      <span className="na-mark">N/A</span>
+      <strong>不适用 · NOT APPLICABLE</strong>
+      <p>{inspection.reason}</p>
+      <p className="na-en">{inspection.reasonEn}</p>
+    </div>;
+  }
+
+  const { method, path, query, duplicateKeys, headers, body, diagnostics } = inspection;
+  const counts = diagnostics.reduce(
+    (result, diagnostic) => ({ ...result, [diagnostic.severity]: result[diagnostic.severity] + 1 }),
+    { error: 0, warning: 0, info: 0 }
+  );
+
+  const jumpToDuplicate = (key: string) => {
+    const target = query?.params.find((param) => param.decodedKey === key);
+    if (target) onNavigate(target.fieldId);
+  };
+
+  return <div className="inspector">
+    <div className="inspector-toolbar">
+      <span className="inspector-hint">点击任意条目可回到字段树对应节点 · Click an item to reveal it in the field tree</span>
+      <div className="mode-toggle" role="group" aria-label="解码视图">
+        <button className={mode === 'raw' ? 'active' : ''} onClick={() => setMode('raw')}>解码前 RAW</button>
+        <button className={mode === 'decoded' ? 'active' : ''} onClick={() => setMode('decoded')}>解码后 DECODED</button>
+      </div>
+    </div>
+
+    {(counts.error > 0 || counts.warning > 0 || counts.info > 0) && (
+      <div className="inspector-summary">
+        {counts.error > 0 && <span className="summary-chip error">⛔ {counts.error} 错误</span>}
+        {counts.warning > 0 && <span className="summary-chip warning">⚠ {counts.warning} 警告</span>}
+        {counts.info > 0 && <span className="summary-chip info">ℹ {counts.info} 提示</span>}
+      </div>
+    )}
+
+    <section className="inspector-section">
+      <h4>请求行 <span>REQUEST LINE</span></h4>
+      <div className="inspector-list">
+        <button type="button" className="inspector-row" onClick={() => onNavigate(method.fieldId)}>
+          <span className="iq-label">Method</span>
+          <code className="iq-value method-badge">{method.value}</code>
+        </button>
+        <div className="inspector-item">
+          <button type="button" className="inspector-row" onClick={() => onNavigate(path.fieldId)}>
+            <span className="iq-label">Path</span>
+            <code className="iq-value">{mode === 'raw' ? path.raw : path.decoded}</code>
+            <DiagnosticBadges diagnostics={path.diagnostics} />
+          </button>
+          <DiagnosticList diagnostics={path.diagnostics} />
+        </div>
+      </div>
+    </section>
+
+    <section className="inspector-section">
+      <h4>Query 参数 <span>{query ? `${query.params.length} PARAMS` : 'NO QUERY'}</span></h4>
+      {query ? <div className="inspector-list">
+        {query.params.length === 0 && <p className="inspector-empty">“?” 之后没有任何参数。</p>}
+        {query.params.map((param) => (
+          <QueryParamRow key={param.id} param={param} mode={mode} onNavigate={onNavigate} />
+        ))}
+      </div> : <p className="inspector-empty">请求目标不包含 “?”，没有 query 字符串。</p>}
+    </section>
+
+    {duplicateKeys.length > 0 && (
+      <div className="inspector-dupes">
+        <strong>重复参数：</strong>
+        {duplicateKeys.map((item) => (
+          <button key={item.key} type="button" onClick={() => jumpToDuplicate(item.key)}>
+            {item.key} × {item.count}
+          </button>
+        ))}
+      </div>
+    )}
+
+    <section className="inspector-section">
+      <h4>Headers <span>{headers.length} FIELDS</span></h4>
+      <div className="inspector-list">
+        {headers.length === 0 && <p className="inspector-empty">没有 Header 字段。</p>}
+        {headers.map((header) => (
+          <button key={header.id} type="button" className="inspector-row" onClick={() => onNavigate(header.fieldId)}>
+            <span className="iq-label">{header.name}</span>
+            <code className="iq-value">{header.value || '(empty)'}</code>
+          </button>
+        ))}
+      </div>
+    </section>
+
+    <section className="inspector-section">
+      <h4>Body <span>PAYLOAD</span></h4>
+      <button type="button" className="inspector-row inspector-body-row" onClick={() => onNavigate(body.fieldId)}>
+        <code className={`iq-value iq-body${body.value ? '' : ' no-value'}`}>{body.value || '(empty)'}</code>
+      </button>
+    </section>
+  </div>;
+}
+
+function QueryParamRow({ param, mode, onNavigate }: {
+  param: QueryParamInspection;
+  mode: 'raw' | 'decoded';
+  onNavigate: (fieldId: string) => void;
+}) {
+  const key = mode === 'raw' ? param.rawKey : param.decodedKey;
+  const value = mode === 'raw' ? param.rawValue : param.decodedValue;
+  return <div className="inspector-item">
+    <button type="button" className="inspector-row" title={`原始文本 / raw: ${param.rawSegment}`} onClick={() => onNavigate(param.fieldId)}>
+      <code className="iq-key">{key || '(empty key)'}</code>
+      {value === null
+        ? <code className="iq-value no-value">∅ 无值</code>
+        : <>
+          <span className="iq-eq">=</span>
+          <code className={`iq-value${value ? '' : ' no-value'}`}>{value || '(empty)'}</code>
+        </>}
+      <DiagnosticBadges diagnostics={param.diagnostics} />
+    </button>
+    <DiagnosticList diagnostics={param.diagnostics} />
   </div>;
 }
 

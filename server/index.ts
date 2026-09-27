@@ -1,10 +1,14 @@
 import express, { type Request, type Response } from 'express';
 import type {
+  HeaderInspection,
   HexRow,
+  InspectionDiagnostic,
   PacketScenario,
   ParseRequest,
   Protocol,
   ProtocolField,
+  QueryParamInspection,
+  RequestInspection,
   SimulatedPacket,
   TimelineEvent
 } from '../shared/types.js';
@@ -51,6 +55,57 @@ function field(id: string, key: string, value: string, description: string, chil
   return { id, key, value, description, ...(children ? { children } : {}) };
 }
 
+/** Split a request target into path and non-empty `&` query segments (offsets are relative to the target). */
+function splitQueryTarget(target: string): {
+  path: string;
+  query: string | null;
+  segments: { segment: string; offset: number }[];
+} {
+  const qIndex = target.indexOf('?');
+  const path = qIndex > -1 ? target.slice(0, qIndex) : target;
+  const query = qIndex > -1 ? target.slice(qIndex + 1) : null;
+  const segments: { segment: string; offset: number }[] = [];
+  if (query !== null) {
+    let cursor = qIndex + 1;
+    for (const segment of query.split('&')) {
+      const offset = cursor;
+      cursor += segment.length + 1;
+      if (segment) segments.push({ segment, offset });
+    }
+  }
+  return { path, query, segments };
+}
+
+/** Target child nodes shared by the field tree and the inspector fieldId links. */
+function targetFieldChildren(target: string): ProtocolField[] {
+  const { path, query, segments } = splitQueryTarget(target);
+  const children = [
+    field('http-target-path', 'Path', path || '/', 'Request path, raw undecoded text')
+  ];
+  if (query !== null) {
+    children.push(
+      field(
+        'http-target-query',
+        'Query',
+        query || '(empty)',
+        'Raw query string, undecoded',
+        segments.map(({ segment }, index) => {
+          const separator = segment.indexOf('=');
+          const key = separator > -1 ? segment.slice(0, separator) : segment;
+          const value = separator > -1 ? segment.slice(separator + 1) : null;
+          return field(
+            `http-query-${index}`,
+            key || `param-${index + 1}`,
+            value === null ? '(no value)' : value || '(empty)',
+            'Query parameter, raw segment'
+          );
+        })
+      )
+    );
+  }
+  return children;
+}
+
 function parseHttpFields(raw: string): ProtocolField[] {
   const [head, body = ''] = raw.split(/\r?\n\r?\n/);
   const lines = head.split(/\r?\n/);
@@ -66,12 +121,199 @@ function parseHttpFields(raw: string): ProtocolField[] {
   return [
     field('http-start-line', isResponse ? 'Status-Line' : 'Request-Line', startLine, isResponse ? 'HTTP version and response status' : 'HTTP method, target and version', [
       field('http-part-1', isResponse ? 'Version' : 'Method', first ?? '—', isResponse ? 'Protocol version' : 'HTTP request method'),
-      field('http-part-2', isResponse ? 'Status' : 'Target', second ?? '—', isResponse ? 'Status code' : 'Request target'),
+      field('http-part-2', isResponse ? 'Status' : 'Target', second ?? '—', isResponse ? 'Status code' : 'Request target', isResponse ? undefined : targetFieldChildren(second ?? '')),
       field('http-part-3', isResponse ? 'Reason' : 'Version', isResponse ? (third ?? '—') : (third ?? '—'), isResponse ? 'Reason phrase' : 'Protocol version')
     ]),
     field('http-headers', 'Headers', `${headers.length} fields`, 'Metadata carried by the application layer', headers),
     field('http-body', 'Payload', body || '(empty)', 'Application payload after the header terminator')
   ];
+}
+
+const HEX_DIGIT = /^[0-9a-fA-F]$/;
+
+/**
+ * Percent-decode one component while preserving the original text.
+ * Malformed `%` escapes are kept verbatim and reported with their absolute
+ * offset inside the request target; `+` becomes a space inside the query.
+ */
+function decodeComponent(
+  raw: string,
+  baseOffset: number,
+  plusAsSpace: boolean
+): { decoded: string; diagnostics: InspectionDiagnostic[] } {
+  const diagnostics: InspectionDiagnostic[] = [];
+  let decoded = '';
+  let bytes: number[] = [];
+  const flushBytes = () => {
+    if (bytes.length) {
+      decoded += Buffer.from(bytes).toString('utf8');
+      bytes = [];
+    }
+  };
+  for (let index = 0; index < raw.length; index += 1) {
+    const char = raw[index];
+    if (char === '%') {
+      const high = raw[index + 1];
+      const low = raw[index + 2];
+      if (high && low && HEX_DIGIT.test(high) && HEX_DIGIT.test(low)) {
+        bytes.push(parseInt(high + low, 16));
+        index += 2;
+      } else {
+        flushBytes();
+        const offset = baseOffset + index;
+        const found = raw.slice(index, index + 3);
+        diagnostics.push({
+          code: 'malformed-encoding',
+          severity: 'error',
+          offset,
+          message: `请求目标位置 ${offset}：“%” 后应为两位十六进制字符（实际为 “${found}”），已按原文保留`,
+          messageEn: `Target offset ${offset}: '%' must be followed by two hex digits (found '${found}'); kept as literal text`
+        });
+        decoded += char;
+      }
+    } else if (plusAsSpace && char === '+') {
+      flushBytes();
+      decoded += ' ';
+    } else {
+      flushBytes();
+      decoded += char;
+    }
+  }
+  flushBytes();
+  return { decoded, diagnostics };
+}
+
+function notApplicable(reason: string, reasonEn: string): RequestInspection {
+  return { applicable: false, reason, reasonEn };
+}
+
+/** Build the semantic request inspection: method, path, query params, headers and body. */
+function inspectHttpRequest(raw: string): RequestInspection {
+  const [head, body = ''] = raw.split(/\r?\n\r?\n/);
+  const lines = head.split(/\r?\n/);
+  const startLine = lines[0] ?? '';
+  if (!startLine.trim() || startLine.startsWith('HTTP/')) {
+    return notApplicable(
+      '当前数据包是 HTTP 响应，没有请求方法、请求目标或查询参数可供检查。',
+      'This packet is an HTTP response; request method, target and query are not present.'
+    );
+  }
+
+  const [method = '', target = ''] = startLine.split(' ');
+  const { path: rawPath, query, segments } = splitQueryTarget(target);
+  const diagnostics: InspectionDiagnostic[] = [];
+
+  const pathDecoded = decodeComponent(rawPath, 0, false);
+  const pathDiagnostics = [...pathDecoded.diagnostics];
+  if (pathDecoded.decoded !== rawPath) {
+    pathDiagnostics.push({
+      code: 'encoded',
+      severity: 'info',
+      message: '路径包含百分号编码，原始文本已保留。',
+      messageEn: 'Path contains percent-encoding; the raw text is preserved.'
+    });
+  }
+  diagnostics.push(...pathDiagnostics);
+
+  const params: QueryParamInspection[] = segments.map(({ segment, offset }, index) => {
+    const separator = segment.indexOf('=');
+    const rawKey = separator > -1 ? segment.slice(0, separator) : segment;
+    const rawValue = separator > -1 ? segment.slice(separator + 1) : null;
+    const keyDecoded = decodeComponent(rawKey, offset, true);
+    const valueDecoded = rawValue === null
+      ? null
+      : decodeComponent(rawValue, offset + separator + 1, true);
+    const paramDiagnostics: InspectionDiagnostic[] = [
+      ...keyDecoded.diagnostics,
+      ...(valueDecoded?.diagnostics ?? [])
+    ];
+    if (keyDecoded.decoded !== rawKey || (valueDecoded && valueDecoded.decoded !== rawValue)) {
+      paramDiagnostics.push({
+        code: 'encoded',
+        severity: 'info',
+        message: '包含百分号编码或 “+”，解码前的原始文本已保留。',
+        messageEn: 'Contains percent-encoding or “+”; the raw pre-decode text is preserved.'
+      });
+    }
+    if (separator === -1) {
+      paramDiagnostics.push({
+        code: 'no-value',
+        severity: 'warning',
+        message: '该参数没有 “=”，属于无值参数。',
+        messageEn: 'Parameter has no “=”, so it carries no value.'
+      });
+    } else if (rawValue === '') {
+      paramDiagnostics.push({
+        code: 'empty-value',
+        severity: 'info',
+        message: '“=” 之后没有内容，参数值为空字符串。',
+        messageEn: 'Nothing follows “=”; the value is an empty string.'
+      });
+    }
+    return {
+      id: `query-param-${index}`,
+      index,
+      rawSegment: segment,
+      rawKey,
+      decodedKey: keyDecoded.decoded,
+      rawValue,
+      decodedValue: valueDecoded ? valueDecoded.decoded : null,
+      diagnostics: paramDiagnostics,
+      fieldId: `http-query-${index}`
+    };
+  });
+
+  const keyCounts = new Map<string, number>();
+  for (const param of params) {
+    keyCounts.set(param.decodedKey, (keyCounts.get(param.decodedKey) ?? 0) + 1);
+  }
+  const duplicateKeys = [...keyCounts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([key, count]) => ({ key, count }));
+  for (const param of params) {
+    const count = keyCounts.get(param.decodedKey) ?? 0;
+    if (count > 1) {
+      param.diagnostics.push({
+        code: 'duplicate-key',
+        severity: 'warning',
+        message: `键 “${param.decodedKey}” 在查询字符串中重复出现 ${count} 次。`,
+        messageEn: `Key '${param.decodedKey}' appears ${count} times in the query string.`
+      });
+    }
+    diagnostics.push(...param.diagnostics);
+  }
+
+  const headers: HeaderInspection[] = lines.slice(1).map((line, index) => {
+    const separator = line.indexOf(':');
+    const name = separator > -1 ? line.slice(0, separator).trim() : line.trim();
+    const value = separator > -1 ? line.slice(separator + 1).trim() : '';
+    return {
+      id: `inspector-header-${index}`,
+      index,
+      name: name || `Header-${index + 1}`,
+      value,
+      fieldId: `header-${index}`
+    };
+  });
+
+  return {
+    applicable: true,
+    method: { value: method || '—', fieldId: 'http-part-1' },
+    target,
+    path: {
+      raw: rawPath,
+      decoded: pathDecoded.decoded,
+      diagnostics: pathDiagnostics,
+      fieldId: 'http-target-path'
+    },
+    query: query === null
+      ? null
+      : { raw: query, fieldId: 'http-target-query', params },
+    duplicateKeys,
+    headers,
+    body: { value: body, fieldId: 'http-body' },
+    diagnostics
+  };
 }
 
 function parseTcpFields(raw: string): ProtocolField[] {
@@ -136,6 +378,12 @@ function checksum(raw: string): string {
 function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string): SimulatedPacket {
   const safeRaw = raw.trim() ? raw : (protocol === 'HTTP' ? HTTP_SAMPLES[scenario] : TCP_SAMPLES[scenario]);
   const isHttp = protocol === 'HTTP';
+  const inspection: RequestInspection = isHttp
+    ? inspectHttpRequest(safeRaw)
+    : notApplicable(
+        '当前数据包是 TCP 报文，没有 HTTP 请求方法、请求目标或查询参数。',
+        'This packet is a TCP segment; HTTP request semantics do not apply.'
+      );
   return {
     id: `${protocol.toLowerCase()}-${scenario}-${Date.now().toString(36).slice(-6)}`,
     protocol,
@@ -147,6 +395,7 @@ function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string):
     hex: hexDump(safeRaw),
     fields: isHttp ? parseHttpFields(safeRaw) : parseTcpFields(safeRaw),
     timeline: timelineFor(protocol, scenario),
+    inspection,
     metadata: {
       capturedAt: new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'),
       source: isHttp ? '10.0.0.24:51842' : safeRaw.split(' > ')[0].replace('TCP ', ''),
